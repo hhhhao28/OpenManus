@@ -51,6 +51,8 @@ class PlanningFlow(BaseFlow):
     active_plan_id: str = Field(default_factory=lambda: f"plan_{int(time.time())}")
     current_step_index: Optional[int] = None
     max_retry_per_step: int = Field(default=2)  # Max retries before replanning
+    max_replan_count: int = Field(default=3)  # Max replanning attempts to prevent infinite loop
+    replan_counts: Dict[int, int] = Field(default_factory=dict)  # Track replans per step
     step_retry_counts: Dict[int, int] = Field(default_factory=dict)  # Track retries per step
 
     def __init__(
@@ -128,9 +130,16 @@ class PlanningFlow(BaseFlow):
 
                 # Check if step is blocked (failed after max retries), trigger replanning
                 # Keep completed steps, replan the blocked step and subsequent steps
+                # Also check max replan count to prevent infinite loop
                 retry_count = self.step_retry_counts.get(self.current_step_index, 0)
+                replan_count = self.replan_counts.get(self.current_step_index, 0)
                 if retry_count >= self.max_retry_per_step:
+                    if replan_count >= self.max_replan_count:
+                        logger.warning(f"Step {self.current_step_index} exceeded max replan attempts, marking as failed...")
+                        result += f"\n--- Task Failed ---\nStep {self.current_step_index} failed after {replan_count} replanning attempts.\nOriginal error: {step_result}\n--- End ---\n"
+                        break
                     logger.info(f"Step {self.current_step_index} is blocked, triggering replanning...")
+                    self.replan_counts[self.current_step_index] = replan_count + 1
                     replan_result = await self._replan(step_result)
                     result += f"\n--- Replanning ---\n{replan_result}\n--- End Replanning ---\n"
 
@@ -358,6 +367,10 @@ class PlanningFlow(BaseFlow):
         if self.current_step_index is None:
             return
 
+        # Clean up retry counts for completed step
+        self.step_retry_counts.pop(self.current_step_index, None)
+        self.replan_counts.pop(self.current_step_index, None)
+
         try:
             # Mark the step as completed
             await self.planning_tool.execute(
@@ -440,13 +453,19 @@ class PlanningFlow(BaseFlow):
 
         # Parse LLM response to get new plan
         try:
-            # Try to extract JSON from response
+            # Try to extract and parse JSON from response with improved robustness
             import re
-            json_match = re.search(r'\{[^{}]*\}', response, re.DOTALL)
+            # Try to find JSON block (supports nested objects)
+            json_pattern = r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}'
+            json_match = re.search(json_pattern, response, re.DOTALL)
             if json_match:
                 new_plan = json.loads(json_match.group())
             else:
                 new_plan = json.loads(response)
+
+            # Validate required fields
+            if not isinstance(new_plan.get("steps"), list):
+                raise ValueError("LLM response missing 'steps' field")
 
             # Combine completed steps with new steps from LLM
             new_steps_from_llm = new_plan.get("steps", [])
@@ -472,21 +491,27 @@ class PlanningFlow(BaseFlow):
             if self.active_plan_id in self.planning_tool.plans:
                 self.planning_tool.plans[self.active_plan_id]["step_statuses"] = new_step_statuses
 
-            # Reset retry count after successful replanning
+            # Reset retry and replan counts after successful replanning
             self.step_retry_counts[self.current_step_index] = 0
+            self.replan_counts[self.current_step_index] = 0
 
             return f"Plan updated successfully. Completed: {len(completed_steps)}, New steps: {new_steps_from_llm}"
         except Exception as e:
             logger.error(f"Failed to parse LLM response or update plan: {e}")
             # Fallback: keep completed steps, mark current as blocked, add retry step
+            # Include original error info for debugging
+            original_error = step_result.strip() if step_result else "Unknown error"
             if plan_data:
-                new_steps = completed_steps + [f"[BLOCKED] {current_step_text}", f"[RETRY] Alternative approach for: {current_step_text}"]
+                new_steps = completed_steps + [
+                    f"[BLOCKED] {current_step_text}",
+                    f"[RETRY] Alternative approach for: {current_step_text}"
+                ]
                 await self.planning_tool.execute(
                     command="update",
                     plan_id=self.active_plan_id,
                     steps=new_steps
                 )
-            return f"Plan updated with fallback strategy. Error: {str(e)}"
+            return f"Plan updated with fallback strategy. Original error: {original_error}. Parse error: {str(e)}"
 
     async def _get_plan_text(self) -> str:
         """Get the current plan as formatted text."""
