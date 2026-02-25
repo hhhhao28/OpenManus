@@ -126,10 +126,11 @@ class PlanningFlow(BaseFlow):
                 step_result = await self._execute_step(executor, step_info)
                 result += step_result + "\n"
 
-                # Check if step failed and needs replanning (after max retries)
+                # Check if step is blocked (failed after max retries), trigger replanning
+                # Keep completed steps, replan the blocked step and subsequent steps
                 retry_count = self.step_retry_counts.get(self.current_step_index, 0)
                 if retry_count >= self.max_retry_per_step:
-                    logger.info(f"Step {self.current_step_index} failed after {retry_count} retries, triggering replanning...")
+                    logger.info(f"Step {self.current_step_index} is blocked, triggering replanning...")
                     replan_result = await self._replan(step_result)
                     result += f"\n--- Replanning ---\n{replan_result}\n--- End Replanning ---\n"
 
@@ -304,16 +305,21 @@ class PlanningFlow(BaseFlow):
         try:
             step_result = await executor.run(step_prompt)
 
-            # Check if the step execution indicates a failure
-            failure_indicators = ["error", "failed", "cannot", "unable to", "could not", "does not exist"]
-            result_lower = step_result.lower()
-            has_failure = any(indicator in result_lower for indicator in failure_indicators)
+            # Check if the step execution indicates a failure (Error: prefix)
+            result_lower = step_result.strip().lower()
+            has_failure = result_lower.startswith("error:")
 
             if has_failure:
-                # Mark the step as blocked and increment retry count
+                # Increment retry count
                 retry_count = self.step_retry_counts.get(self.current_step_index, 0) + 1
                 self.step_retry_counts[self.current_step_index] = retry_count
-                await self._mark_step_blocked(step_result, f"Failed (retry {retry_count}/{self.max_retry_per_step})")
+
+                # Only mark as blocked after max retries reached
+                if retry_count >= self.max_retry_per_step:
+                    await self._mark_step_blocked(step_result, f"Failed after {retry_count} retries")
+                else:
+                    # Still in progress, will retry
+                    logger.info(f"Step {self.current_step_index} failed, retry {retry_count}/{self.max_retry_per_step}")
             else:
                 # Mark the step as completed after successful execution
                 await self._mark_step_completed()
@@ -321,10 +327,14 @@ class PlanningFlow(BaseFlow):
             return step_result
         except Exception as e:
             logger.error(f"Error executing step {self.current_step_index}: {e}")
-            # Mark the step as blocked when exception occurs
+            # Increment retry count
             retry_count = self.step_retry_counts.get(self.current_step_index, 0) + 1
             self.step_retry_counts[self.current_step_index] = retry_count
-            await self._mark_step_blocked(str(e), f"Exception (retry {retry_count}/{self.max_retry_per_step})")
+
+            # Only mark as blocked after max retries reached
+            if retry_count >= self.max_retry_per_step:
+                await self._mark_step_blocked(str(e), f"Exception after {retry_count} retries")
+
             return f"Error executing step {self.current_step_index}: {str(e)}"
 
     async def _mark_step_blocked(self, reason: str = "", notes: str = "") -> None:
@@ -377,27 +387,53 @@ class PlanningFlow(BaseFlow):
     async def _replan(self, step_result: str) -> str:
         """
         Replan by analyzing failure reason with LLM, then directly update the plan.
+        Keeps completed steps, replans the blocked step and subsequent steps.
         Flow calls LLM to get analysis, then updates plan using PlanningTool (not via LLM tool call).
         """
         # Get current plan info
         plan_text = await self._get_plan_text()
         plan_data = self.planning_tool.plans.get(self.active_plan_id)
+
+        # Find completed steps (keep them in the new plan)
+        completed_steps = []
         current_step_text = ""
+        subsequent_steps = []
+
         if plan_data and self.current_step_index is not None:
             steps = plan_data.get("steps", [])
-            if self.current_step_index < len(steps):
-                current_step_text = steps[self.current_step_index]
+            step_statuses = plan_data.get("step_statuses", [])
 
-        # Call LLM to analyze failure and get new plan
+            for i, step in enumerate(steps):
+                if i < self.current_step_index:
+                    # Steps before current one - keep if completed
+                    if i < len(step_statuses) and step_statuses[i] == PlanStepStatus.COMPLETED.value:
+                        completed_steps.append(step)
+                elif i == self.current_step_index:
+                    # Current step (blocked) - get text for analysis
+                    current_step_text = step
+                else:
+                    # Subsequent steps
+                    subsequent_steps.append(step)
+
+        # Call LLM to analyze failure and get new plan (only for blocked and subsequent steps)
         system_msg = Message.system_message(
             "You are a planning assistant. Analyze the failure and provide a new plan. "
             "Respond with JSON only: {\"title\": \"new title\", \"steps\": [\"step1\", \"step2\", ...]}"
         )
+
+        # Build user message with context about completed steps
+        completed_context = ""
+        if completed_steps:
+            completed_context = f"\n\nCOMPLETED STEPS (keep these, do not repeat):\n" + "\n".join(f"- {s}" for s in completed_steps)
+
         user_msg = Message.user_message(
-            f"Current plan:\n{plan_text}\n\n"
-            f"Failed step: {current_step_text}\n\n"
+            f"Current plan:\n{plan_text}\n"
+            f"{completed_context}\n\n"
+            f"BLOCKED STEP (needs to be replanned): {current_step_text}\n\n"
             f"Failure result:\n{step_result}\n\n"
-            f"Please analyze why this step failed and provide an updated plan with new steps to complete the task."
+            f"Please analyze why this step failed and provide an updated plan. "
+            f"IMPORTANT: Do NOT include already completed steps in your response. "
+            f"Only provide new steps to replace the blocked step and handle any remaining work."
         )
 
         response = await self.llm.ask(messages=[user_msg], system_msgs=[system_msg])
@@ -412,29 +448,39 @@ class PlanningFlow(BaseFlow):
             else:
                 new_plan = json.loads(response)
 
+            # Combine completed steps with new steps from LLM
+            new_steps_from_llm = new_plan.get("steps", [])
+            final_steps = completed_steps + new_steps_from_llm
+
+            # Update step statuses: keep COMPLETED for old steps, reset others to NOT_STARTED
+            new_step_statuses = []
+            for i, step in enumerate(final_steps):
+                if i < len(completed_steps):
+                    new_step_statuses.append(PlanStepStatus.COMPLETED.value)
+                else:
+                    new_step_statuses.append(PlanStepStatus.NOT_STARTED.value)
+
             # Directly update the plan using PlanningTool
             await self.planning_tool.execute(
                 command="update",
                 plan_id=self.active_plan_id,
                 title=new_plan.get("title"),
-                steps=new_plan.get("steps")
+                steps=final_steps
             )
+
+            # Update step statuses
+            if self.active_plan_id in self.planning_tool.plans:
+                self.planning_tool.plans[self.active_plan_id]["step_statuses"] = new_step_statuses
 
             # Reset retry count after successful replanning
             self.step_retry_counts[self.current_step_index] = 0
 
-            return f"Plan updated successfully. New steps: {new_plan.get('steps')}"
+            return f"Plan updated successfully. Completed: {len(completed_steps)}, New steps: {new_steps_from_llm}"
         except Exception as e:
             logger.error(f"Failed to parse LLM response or update plan: {e}")
-            # Fallback: mark current step as blocked and add a new step
-            await self.planning_tool.execute(
-                command="mark_step",
-                plan_id=self.active_plan_id,
-                step_index=self.current_step_index,
-                step_status=PlanStepStatus.BLOCKED.value
-            )
+            # Fallback: keep completed steps, mark current as blocked, add retry step
             if plan_data:
-                new_steps = plan_data.get("steps", []) + [f"[RETRY] Alternative approach for: {current_step_text}"]
+                new_steps = completed_steps + [f"[BLOCKED] {current_step_text}", f"[RETRY] Alternative approach for: {current_step_text}"]
                 await self.planning_tool.execute(
                     command="update",
                     plan_id=self.active_plan_id,
